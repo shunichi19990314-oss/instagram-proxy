@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn>=0.27
+httpx>=0.27
+# 上流が Content-Encoding: br を返す場合のみ（任意）
+brotli>=1.1

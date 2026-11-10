@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Instagram Proxy — viewer</title>
+<style>
+  :root {
+    --bg: #0b0d10; --bar: #14181d; --fg: #e7eaee; --dim: #9aa4b2;
+    --line: #262d36; --accent: #4f8cff; --ok: #35c67a; --err: #ff5c5c;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  #bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    background: var(--bar); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  button { background: #1d232b; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px; cursor: pointer; font: inherit; }
+  button:hover { border-color: #3b4654; }
+  button:disabled { opacity: .4; cursor: default; }
+  input[type=text] { flex: 1; min-width: 200px; background: #0f1318; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font: inherit; }
+  #status { font-size: 12px; color: var(--dim); white-space: nowrap; }
+  #status b { color: var(--ok); font-variant-numeric: tabular-nums; }
+  #status.busy b { color: var(--accent); }
+  #status.err b { color: var(--err); }
+  main { position: relative; flex: 1; }
+  iframe { width: 100%; height: 100%; border: 0; background: #fff; }
+  #cover { position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; flex-direction: column; gap: 12px;
+    background: radial-gradient(circle at 50% 30%, #17202b, #0b0d10 70%); z-index: 5; }
+  #cover.hidden { display: none; }
+  .spinner { width: 38px; height: 38px; border-radius: 50%;
+    border: 3px solid #2a3340; border-top-color: var(--accent);
+    animation: spin 900ms linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #cover p { color: var(--dim); margin: 0; }
+  #log { max-width: 520px; font: 12px/1.5 ui-monospace, monospace; color: var(--err);
+    white-space: pre-wrap; text-align: left; }
+  .chip { font-size: 11px; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 999px; padding: 2px 8px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <button id="back" title="戻る">←</button>
+    <button id="fwd" title="進む">→</button>
+    <button id="reload" title="再読み込み">⟳</button>
+    <input id="url" type="text" value="https://www.instagram.com/" spellcheck="false">
+    <button id="go">開く</button>
+    <span class="chip" id="mode"></span>
+    <span id="status"><b>idle</b></span>
+    <button id="reset" title="サーバー側の Cookie を削除">セッション破棄</button>
+  </div>
+  <main>
+    <div id="cover"><div class="spinner"></div><p id="msg">読み込んでいます…</p><div id="log"></div></div>
+    <iframe id="frame" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+  </main>
+</div>
+<script>
+(() => {
+  "use strict";
+  const PREFIX = "/p/";
+  const $ = (id) => document.getElementById(id);
+  const frame = $("frame"), cover = $("cover"), msg = $("msg"), log = $("log");
+  const urlInput = $("url"), status = $("status"), modeChip = $("mode");
+  const toProxy = (u) => PREFIX + encodeURIComponent(u);
+  const fromProxy = (u) => { try { return decodeURIComponent(u.slice(PREFIX.length)); } catch { return u; } };
+  const now = () => new Date().toLocaleTimeString("ja-JP", { hour12: false });
+
+  let target = "https://www.instagram.com/";
+  let ready = false, healthTimer = 0, recovery = 0;
+  const MAX_RECOVERY = 3, HEALTH_DELAY = 22000;
+
+  function setStatus(text, kind) {
+    status.className = kind || "";
+    status.innerHTML = "<b>" + text + "</b>";
+  }
+  function clientLog(level, event, details = {}) {
+    fetch("/_diag/instagram", {
+      method: "POST", credentials: "omit", keepalive: true,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source: "viewer", level, event, details, ts: new Date().toISOString() })
+    }).catch(() => {});
+  }
+
+  // 本物の syncInputReactState 相当（プロキシ越しに React の入力が反映されない対策）
+  function syncInputReactState(el, value) {
+    try {
+      const rk = Object.keys(el).find((k) => k.startsWith("__reactProps$") || k.startsWith("__reactEventHandlers$"));
+      if (rk && typeof el[rk]?.onChange === "function") {
+        el[rk].onChange({ currentTarget: el, target: el,
+          preventDefault() {}, stopPropagation() {} });
+      }
+      el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    } catch (_) {}
+  }
+
+  // 本物の currentDocumentHealthy 相当
+  function documentHealthy() {
+    try {
+      const doc = frame.contentDocument;
+      if (!doc || !doc.body) return { healthy: false, loading: true };
+      const body = doc.body;
+      const hasAnchor = !!doc.querySelector(
+        "main, input[name='email'], input[name='username'], video, img, a[href]"
+      );
+      const enough = (body.innerText || "").trim().length > 40 || body.querySelectorAll("img,video").length > 0;
+      return { healthy: hasAnchor && enough, loading: false };
+    } catch (_) {
+      // クロスオリジンになった場合は healthy 判定不能 -> 成功とみなす
+      return { healthy: true, loading: false };
+    }
+  }
+
+  function armHealthCheck(delay = HEALTH_DELAY) {
+    clearTimeout(healthTimer);
+    healthTimer = setTimeout(() => {
+      const snap = documentHealthy();
+      if (snap.healthy) return showHealthy();
+      if (snap.loading) return armHealthCheck(8000);
+      recover("blank-or-unhydrated");
+    }, delay);
+  }
+
+  function showHealthy() {
+    cover.classList.add("hidden");
+    ready = true;
+    setStatus("ok " + now(), "");
+    log.textContent = "";
+    recovery = 0;
+  }
+
+  function recover(reason) {
+    if (recovery >= MAX_RECOVERY) {
+      cover.classList.remove("hidden");
+      msg.textContent = "読み込めませんでした。再読み込みしてください。";
+      setStatus("failed", "err");
+      clientLog("error", "recovery-give-up", { reason });
+      return;
+    }
+    recovery += 1;
+    clientLog("warn", "recovery-start", { attempt: recovery, reason });
+    cover.classList.remove("hidden");
+    msg.textContent = `復旧中… (${recovery}/${MAX_RECOVERY})`;
+    setStatus("recovering " + recovery, "busy");
+    setTimeout(() => navigate(target, true), recovery * 1000);
+  }
+
+  function navigate(url, isRecovery) {
+    if (!url) return;
+    if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+    target = url;
+    urlInput.value = url;
+    try { localStorage.setItem("sh.instagram.target.v1", url); } catch (_) {}
+    if (!isRecovery) { clearTimeout(healthTimer); recovery = 0; }
+    cover.classList.remove("hidden");
+    msg.textContent = "読み込んでいます…";
+    setStatus("loading…", "busy");
+    frame.src = toProxy(url);
+    armHealthCheck();
+    clientLog("info", "navigate", { url });
+  }
+
+  $("go").addEventListener("click", () => {
+    let v = urlInput.value.trim();
+    if (!v) return;
+    // 検索語なら Instagram の検索、URL ならそのまま
+    if (!/^https?:\/\//i.test(v) && !v.includes(".")) {
+      v = "https://www.instagram.com/explore/search/keyword/?q=" + encodeURIComponent(v);
+    }
+    navigate(v);
+  });
+  urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") $("go").click(); });
+  $("reload").addEventListener("click", () => navigate(target, true));
+  $("back").addEventListener("click", () => {
+    try { frame.contentWindow.history.back(); } catch (_) { navigate(target, true); }
+  });
+  $("fwd").addEventListener("click", () => {
+    try { frame.contentWindow.history.forward(); } catch (_) {}
+  });
+  $("reset").addEventListener("click", async () => {
+    await fetch("/session", { method: "DELETE" });
+    try { localStorage.removeItem("sh.instagram.target.v1"); } catch (_) {}
+    setStatus("session cleared", "");
+    navigate("https://www.instagram.com/");
+  });
+
+  frame.addEventListener("load", () => {
+    armHealthCheck(ready ? 2500 : HEALTH_DELAY);
+  });
+  frame.addEventListener("error", () => recover("iframe-error"));
+
+  // 1 秒ごとに iframe の現在 URL を URL バーへ反映（同一オリジン時のみ）
+  setInterval(() => {
+    try {
+      const href = frame.contentWindow.location.href || "";
+      if (href.startsWith(PREFIX)) {
+        const real = fromProxy(href.split("?")[0]);
+        if (real && real !== target) { target = real; urlInput.value = real; }
+      }
+    } catch (_) {}
+  }, 1000);
+
+  fetch("/health").then((r) => r.json()).then((j) => {
+    modeChip.textContent = "mode:" + j.mode;
+  }).catch(() => {});
+
+  const saved = (() => { try { return localStorage.getItem("sh.instagram.target.v1"); } catch { return null; } })();
+  navigate(saved || "https://www.instagram.com/");
+})();
+</script>
+</body>
+</html>
