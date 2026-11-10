@@ -74,6 +74,32 @@ curl -s -o /dev/null -w "%{http_code}\n" "$BASE/p/https%3A%2F%2Fwww.instagram.co
 curl -s "$BASE/api/media-url?url=https%3A%2F%2Fstatic.cdninstagram.com%2Frsrc.php%2Fyr%2Fr%2FrzWiSjZRxk5.webp"
 ```
 
+## 3.5 Instagram が 429 / 「Pageは利用できません」になる場合【重要】
+
+Instagram は **データセンター / クラウドの IP を厳しく弾きます**。Railway・Render・Cloud Run などの
+IP で `https://www.instagram.com/` を取得すると、HTML 自体は返るものの
+`/ajax/bulk-route-definitions/` が **429** になり、SPA が「Pageは利用できません」を表示します。
+（検証時、同等のデータセンター回線から Instagram を**直接**叩いても同じ 429 が出ることを確認済み）
+
+対策は **出口プロキシ** です。
+
+```bash
+# Railway → Variables
+PROXY_UPSTREAM_PROXY = socks5://USER:PASS@HOST:PORT
+# または
+PROXY_UPSTREAM_PROXY = http://USER:PASS@HOST:PORT
+```
+
+- 住宅用/モバイル回線のプロキシ、または自宅サーバーの SOCKS5 を推奨
+- 反映後 `/health` の `upstream_proxy` が `true` になっていることを確認
+- SOCKS5 は `PySocks`（requirements に含む）が必要
+
+この設定が無い場合の挙動:
+| 症状 | 意味 |
+|---|---|
+| 画面に「Instagram 側がこのサーバーの IP をブロックしています」 | `PROXY_UPSTREAM_PROXY` 未設定（IG 側のレート制限） |
+| `/health` は OK・`/p/...` が 200 で HTML が返る | プロキシ実装自体は正常（IP の問題） |
+
 ## 4. 注意点（Railway 固有）
 
 - **メモリ**: 無料枠は 512MB 程度。Instagram の HTML は 300〜400KB、CSS は 800KB 級なので、同時アクセスが多いと書換処理でメモリを使います。`numReplicas: 1` のまま、必要なら `PROXY_TIMEOUT` を短くしてください。

@@ -41,9 +41,26 @@ def test_to_proxy_url_keeps_data_and_hash():
 
 def test_to_proxy_url_relative_and_protocol_relative():
     base = "https://www.instagram.com/"
-    assert to_proxy_url("/static/app.js", base) == proxy_path(CFG.prefix, "https://www.instagram.com/static/app.js")
+    # sticky host（既定）: 同一ホストはパスのまま返す（SPA ルーターを壊さない）
+    assert to_proxy_url("/static/app.js", base) == "/static/app.js"
+    assert to_proxy_url("https://www.instagram.com/reels/", base) == "/reels/"
+    # ルートはビューアと衝突するのでマーカーが付く
+    assert to_proxy_url("https://www.instagram.com/", base) == "/?_ig=1"
     # プロトコル相対 + メディアホスト → media-relay
     assert to_proxy_url("//cdninstagram.com/a.jpg", base).startswith(CFG.media_relay)
+    # 別ホスト（非メディア）→ /_ext/
+    assert to_proxy_url("https://accounts.google.com/x", base).startswith(CFG.ext_prefix)
+
+
+def test_to_proxy_url_legacy_mode():
+    """sticky を切ると従来の /p/<encoded> 方式になる"""
+    CFG.sticky_host = False
+    try:
+        base = "https://www.instagram.com/"
+        assert to_proxy_url("/static/app.js", base) == proxy_path(
+            CFG.prefix, "https://www.instagram.com/static/app.js")
+    finally:
+        CFG.sticky_host = True
     out = to_proxy_url("https://scontent.cdninstagram.com/v/a.jpg?x=1", base)
     # メディア系ホストは media-relay（k= と s= 付き）に寄せる
     assert out.startswith(CFG.media_relay + "?k=")
@@ -108,8 +125,10 @@ def test_rewrite_html_attrs_srcset_style():
     out = rewrite_html(html, "https://www.instagram.com/")
     assert "Content-Security-Policy" not in out      # CSP は除去
     assert "<base" not in out                        # base は除去
-    assert out.count("/p/") >= 3                     # href / script src / srcset の相対分
-    assert CFG.media_relay in out                    # メディアは media-relay へ
+    # sticky: 同一ホストはパスのまま、CDN だけ media-relay に寄る
+    assert 'href="/explore/"' in out
+    assert 'src="/static/app.js"' in out
+    assert CFG.media_relay in out
     assert "integrity=" not in out and "crossorigin" not in out
     k = [x for x in out.split('?k=') if x][1].split('&')[0]
     from proxy.urlmap import decode_media_key
@@ -125,12 +144,14 @@ def test_rewrite_html_keeps_js_href():
 def test_rewrite_css_and_js():
     css = "@import 'x.css'; .a{background:url(/img/a.png)} .b{background:url(https://scontent.cdninstagram.com/b.jpg)}"
     out = rewrite_css(css, "https://www.instagram.com/")
-    assert out.count("/p/") == 2          # @import と相対 url()
-    assert CFG.media_relay in out         # メディア URL は別経路
+    assert '@import "/x.css"' in out       # 同一ホストはそのまま
+    assert 'url("/img/a.png")' in out
+    assert CFG.media_relay in out          # メディア URL は別経路
 
     js = 'const a="/api/graphql"; const b="https://scontent.cdninstagram.com/c.jpg";'
     out_js = rewrite_js(js, "https://www.instagram.com/")
-    assert "/p/" in out_js
+    assert "/api/graphql" in out_js        # 同一ホストはそのまま
+    assert CFG.media_relay in out_js       # CDN は media-relay
 
 
 # --------------------------------------------------------------- Cookie

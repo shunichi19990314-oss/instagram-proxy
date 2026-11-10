@@ -53,14 +53,22 @@ class Config:
     upstream_timeout: float = float(os.getenv("PROXY_TIMEOUT", "30"))
     connect_timeout: float = float(os.getenv("PROXY_CONNECT_TIMEOUT", "10"))
     referer_for_media: str = "https://www.instagram.com/"
+    max_retries: int = int(os.getenv("PROXY_MAX_RETRIES", "2"))
+    # 上流（Instagram）への出口プロキシ。データセンター IP が 429 になる場合に必要
+    #   例: socks5://user:pass@host:1080 / http://host:8080
+    upstream_proxy: str = os.getenv("PROXY_UPSTREAM_PROXY", "")
 
     # --- セッション ---
+    default_target: str = os.getenv("PROXY_DEFAULT_TARGET", "https://www.instagram.com/")
     session_ttl: int = 6 * 3600
     max_sessions: int = 2000
     cookie_name: str = "spsid"
 
     # --- ルーティング ---
-    prefix: str = "/p/"                                  # 仮想 URL 空間
+    # 同一ホストのリンクは「元のパスのまま」返し（SPA のルーターを壊さない）、
+    # 別ホストへの参照だけ /_ext/<encoded> に退避する “sticky host” 方式。
+    ext_prefix: str = "/_ext/"                           # 別ホスト用の明示プロキシ
+    prefix: str = "/p/"                                  # 互換エイリアス（絶対URL指定）
     http_relay: str = "/instagram/runtime/http-relay"    # バイナリリレー
     media_relay: str = "/instagram/runtime/media-relay"  # メディア専用
     diag: str = "/_diag/instagram"
@@ -71,6 +79,8 @@ class Config:
 
     # メディア系ホストは /p/ ではなく media-relay（キャッシュ・署名付き）へ寄せる
     media_via_relay: bool = os.getenv("PROXY_MEDIA_RELAY", "1") == "1"
+    # 同一ホストのリンクを元パスのまま返す（SPA を壊さない）。0 で従来の /p/ 方式
+    sticky_host: bool = os.getenv("PROXY_STICKY_HOST", "1") == "1"
 
     def host_allowed(self, host: str) -> bool:
         h = (host or "").lower().rstrip(".")

@@ -141,8 +141,8 @@ def test_proxy_html_rewrite(servers):
     assert r.status_code == 200
     body = r.text
     assert "dummy instagram" in body
-    assert "/p/" in body                      # 相対 URL が仮想URLに変換されている
-    assert body.count("/p/") >= 4
+    assert "__PROXY_SHIMMED__" in body        # 実行時シムが注入される
+    assert 'href="/explore/"' in body         # sticky: 同一ホストはパスのまま
     assert CFG.cookie_name in r.cookies       # セッション Cookie が発行される
 
 
@@ -152,16 +152,17 @@ def test_proxy_css_js_and_redirect(servers):
 
     q = lambda p: servers["px"] + "/p/" + quote(servers["up"] + p, safe="")
     css = httpx.get(q("/static/app.css"), timeout=10)
-    # 上流ホストが media 扱いなので url() は media-relay に寄る
-    assert "url(\"" + CFG.media_relay in css.text
     assert "background" in css.text
+    # sticky: 同一ホストの url() はパスのまま
+    assert 'url("/media/bg.png")' in css.text
 
     js = httpx.get(q("/static/app.js"), timeout=10)
     assert "fetch(" in js.text
 
     r = httpx.get(q("/redirect"), follow_redirects=False, timeout=10)
     loc = r.headers["location"]
-    assert r.status_code == 302 and (loc.startswith("/p/") or loc.startswith(CFG.media_relay))
+    # sticky: 同一ホストへのリダイレクトはパスのまま書き換えられる
+    assert r.status_code == 302 and loc == "/explore/"
 
 
 def test_cookie_isolation_and_injection(servers):

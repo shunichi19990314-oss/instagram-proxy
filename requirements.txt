@@ -1,5 +1,8 @@
 fastapi>=0.110
 uvicorn>=0.27
 httpx>=0.27
+httpcore>=1.0
 # 上流が Content-Encoding: br を返す場合のみ（任意）
 brotli>=1.1
+# SOCKS5 出口プロキシ（PROXY_UPSTREAM_PROXY=socks5://…）を使う場合のみ
+PySocks>=1.7

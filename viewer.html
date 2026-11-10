@@ -36,6 +36,10 @@
     animation: spin 900ms linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   #cover p { color: var(--dim); margin: 0; }
+  #hint { max-width: 640px; font-size: 12px; line-height: 1.7; color: #ffb4b4;
+    border: 1px solid #5a2a2a; background: #1e1213; border-radius: 10px;
+    padding: 10px 14px; margin-top: 6px; display: none; text-align: left; }
+  #hint b { color: #ffd9d9; }
   #log { max-width: 520px; font: 12px/1.5 ui-monospace, monospace; color: var(--err);
     white-space: pre-wrap; text-align: left; }
   .chip { font-size: 11px; color: var(--dim); border: 1px solid var(--line);
@@ -55,19 +59,42 @@
     <button id="reset" title="サーバー側の Cookie を削除">セッション破棄</button>
   </div>
   <main>
-    <div id="cover"><div class="spinner"></div><p id="msg">読み込んでいます…</p><div id="log"></div></div>
+    <div id="cover"><div class="spinner"></div><p id="msg">読み込んでいます…</p>
+      <div id="hint"></div>
+      <div id="log"></div></div>
     <iframe id="frame" referrerpolicy="strict-origin-when-cross-origin"></iframe>
   </main>
 </div>
 <script>
 (() => {
   "use strict";
-  const PREFIX = "/p/";
+  const PREFIX = "/p/";     // 絶対URLを明示する互換経路
+  const EXT = "/_ext/";     // 別ホスト用
   const $ = (id) => document.getElementById(id);
   const frame = $("frame"), cover = $("cover"), msg = $("msg"), log = $("log");
   const urlInput = $("url"), status = $("status"), modeChip = $("mode");
-  const toProxy = (u) => PREFIX + encodeURIComponent(u);
-  const fromProxy = (u) => { try { return decodeURIComponent(u.slice(PREFIX.length)); } catch { return u; } };
+  // sticky: 同一ホスト(instagram.com)の URL はパスだけ使う
+  const SAME_HOST = "www.instagram.com";
+  const toProxy = (u) => {
+    try {
+      const url = new URL(u, location.origin);
+      if (url.host.toLowerCase() === SAME_HOST) {
+        // ルート("/") はビューア自身と衝突するのでマーカーを付ける
+        if (!url.pathname || url.pathname === "/") {
+          return "/?_ig=1" + (url.search ? "&" + url.search.slice(1) : "") + url.hash;
+        }
+        return url.pathname + url.search + url.hash;
+      }
+      if (url.host === location.host) return (url.pathname || "/") + url.search;
+      return EXT + encodeURIComponent(url.href);
+    } catch (_) { return PREFIX + encodeURIComponent(u); }
+  };
+  const fromProxy = (p) => {
+    try {
+      if (p.startsWith(EXT)) return decodeURIComponent(p.slice(EXT.length));
+      return "https://" + SAME_HOST + (p.startsWith("/") ? p : "/" + p);
+    } catch (_) { return p; }
+  };
   const now = () => new Date().toLocaleTimeString("ja-JP", { hour12: false });
 
   let target = "https://www.instagram.com/";
@@ -124,6 +151,24 @@
       if (snap.loading) return armHealthCheck(8000);
       recover("blank-or-unhydrated");
     }, delay);
+  }
+
+  // Instagram がデータセンター IP を弾いている場合の案内
+  function detectBlocked() {
+    try {
+      const doc = frame.contentDocument;
+      if (!doc || !doc.body) return false;
+      const t = (doc.title || "") + " " + (doc.body.innerText || "");
+      return /Pageは利用できません|Page isn.t available|リンクが破損/.test(t);
+    } catch (_) { return false; }
+  }
+
+  function showHint(text) {
+    const el = $("hint");
+    if (!el) return;
+    if (!text) { el.style.display = "none"; return; }
+    el.innerHTML = text;
+    el.style.display = "block";
   }
 
   function showHealthy() {
@@ -191,15 +236,29 @@
 
   frame.addEventListener("load", () => {
     armHealthCheck(ready ? 2500 : HEALTH_DELAY);
+    setTimeout(() => {
+      if (detectBlocked()) {
+        cover.classList.remove("hidden");
+        msg.textContent = "Instagram 側がこのサーバーの IP をブロックしています";
+        showHint(
+          "IG はデータセンター IP からのアクセスを <b>429 / 利用できません</b> で拒否します。" +
+          "プロキシ自体は動作しています（HTML/CSS/JS の書換・Cookie・ルーティングは正常）。<br>" +
+          "解決するには <b>出口プロキシ</b> が必要です: Railway の Variables に " +
+          "<code>PROXY_UPSTREAM_PROXY</code>（例 <code>socks5://…</code>）を設定してください。"
+        );
+        clientLog("warn", "blocked-by-upstream", { url: target });
+      }
+    }, 6000);
   });
   frame.addEventListener("error", () => recover("iframe-error"));
 
   // 1 秒ごとに iframe の現在 URL を URL バーへ反映（同一オリジン時のみ）
   setInterval(() => {
     try {
-      const href = frame.contentWindow.location.href || "";
-      if (href.startsWith(PREFIX)) {
-        const real = fromProxy(href.split("?")[0]);
+      const loc = frame.contentWindow.location;
+      if (!loc) return;
+      if (loc.host === location.host) {
+        const real = "https://" + SAME_HOST + loc.pathname + loc.search;
         if (real && real !== target) { target = real; urlInput.value = real; }
       }
     } catch (_) {}

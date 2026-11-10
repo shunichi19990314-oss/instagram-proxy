@@ -74,14 +74,39 @@ def to_proxy_url(ref: str, base_url: str, force_scheme: bool = False) -> str:
     # 既にプロキシ済みなら触らない
     if target.startswith(("http://", "https://")) and CFG.prefix in target:
         return ref
+    if target.startswith(CFG.ext_prefix) or target.startswith(CFG.media_relay):
+        return ref
+
+    base_host = (urllib_parse.urlsplit(base_url).hostname or "").lower()
+    target_parts = urllib_parse.urlsplit(target)
+    target_host = (target_parts.hostname or "").lower()
+
+    # 同一ホスト → 元のパス・クエリのまま（Instagram の SPA ルーターを壊さない）
+    if CFG.sticky_host and target_host == base_host:
+        local = target_parts.path or "/"
+        if target_parts.query:
+            local += "?" + target_parts.query
+        if target_parts.fragment:
+            local += "#" + target_parts.fragment
+        # ルート "/" はビューア自身と衝突するのでマーカーを付ける
+        if local == "/":
+            local = "/?_ig=1"
+        elif local.startswith("/?"):
+            local = "/?_ig=1&" + local[2:]
+        return local
 
     # 画像・動画 CDN は media-relay（署名 + キャッシュ）に寄せる
-    if CFG.media_via_relay and CFG.is_media_host(urllib_parse.urlsplit(target).hostname or ""):
+    if CFG.media_via_relay and CFG.is_media_host(target_host):
         k = encode_media_key(target)
         s = sign_media_url(target, CFG.hash_key)
         return f"{CFG.media_relay}?k={urllib_parse.quote(k, safe='')}&s={s}"
 
-    return proxy_path(CFG.prefix, target)
+    # sticky 無効時は従来どおり /p/<encoded absolute url>
+    if not CFG.sticky_host:
+        return proxy_path(CFG.prefix, target)
+
+    # 別ホスト → 明示的なプロキシ経路（/_ext/<encoded>）
+    return CFG.ext_prefix + urllib_parse.quote(target, safe="")
 
 
 def rewrite_srcset(value: str, base_url: str) -> str:
@@ -242,31 +267,114 @@ SHIM = """
 /* minimal proxy shim (Scramjet の controller.inject.js 相当の最小版) */
 (function () {
   "use strict";
-  window.__PROXY_PREFIX__ = "%(prefix)s";
-  // pushState で入る相対パスを仮想URL空間に寄せる
-  const push = history.pushState.bind(history);
-  history.pushState = function (state, title, url) {
-    if (url && typeof url === "string" && url.startsWith("/") && !url.startsWith("%(prefix)s")) {
-      url = "%(prefix)s" + encodeURIComponent(location.origin + url);
-    }
-    return push(state, title, url);
+  var EXT = "%(ext)s", MEDIA = "%(media)s", PREFIX = "%(prefix)s";
+  window.__PROXY_SHIMMED__ = true;
+  window.__PROXY_PREFIX__ = PREFIX;
+
+  // 相対パス/絶対URLを「プロキシ内で解決できる URL」に変換する
+  function toProxy(u, base) {
+    try {
+      if (!u) return u;
+      if (typeof u !== "string") return u;
+      var s = u.trim();
+      if (!s) return u;
+      if (/^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i.test(s)) return u;
+      if (s.indexOf(EXT) === 0 || s.indexOf(MEDIA) === 0) return u;
+      var url = new URL(s, base || location.href);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return u;
+      // 同一オリジン（= プロキシ先のホスト）はパスのまま
+      if (url.host === location.host) {
+        return EXT === "/_ext/" && url.pathname.indexOf(EXT) === 0
+          ? url.pathname + url.search + url.hash
+          : url.pathname + url.search + url.hash;
+      }
+      return EXT + encodeURIComponent(url.href);
+    } catch (e) { return u; }
+  }
+  window.__proxyTo = toProxy;
+
+  // --- fetch ---
+  var rawFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    try {
+      if (typeof input === "string" || input instanceof URL) {
+        input = toProxy(String(input));
+      } else if (input && input.url) {
+        var r = toProxy(input.url);
+        if (r !== input.url) input = new Request(r, input);
+      }
+    } catch (e) {}
+    return rawFetch(input, init);
   };
-  // 相対リンク対策：クリック時に base が無いので絶対URLで開く
-  document.addEventListener("click", function (e) {
-    const a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
-    if (!a) return;
-    const h = a.getAttribute("href");
-    if (!h || !h.startsWith("%(prefix)s")) return;
-    if (a.target === "_blank") a.rel = "noopener noreferrer";
-  }, true);
-  // 例外はテレメトリへ（本物の /_diag/instagram 相当）
+
+  // --- XMLHttpRequest ---
+  var rawOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    var args = Array.prototype.slice.call(arguments);
+    try { args[1] = toProxy(String(url)); } catch (e) {}
+    return rawOpen.apply(this, args);
+  };
+
+  // --- navigator.sendBeacon ---
+  if (navigator.sendBeacon) {
+    var rawBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {
+      try { url = toProxy(String(url)); } catch (e) {}
+      return rawBeacon(url, data);
+    };
+  }
+
+  // --- history API（SPA の遷移を壊さない）---
+  ["pushState", "replaceState"].forEach(function (k) {
+    var orig = history[k].bind(history);
+    history[k] = function (state, title, url) {
+      if (url) {
+        try {
+          var u = new URL(String(url), location.href);
+          if (u.host === location.host) {
+            url = u.pathname + u.search + u.hash;
+            if (u.pathname === "/" && url.indexOf("_ig=") === -1) {
+              url = "/?_ig=1" + (u.search ? "&" + u.search.slice(1) : "") + u.hash;
+            }
+          }
+        } catch (e) {}
+      }
+      return orig(state, title, url);
+    };
+  });
+
+  // --- Service Worker: 登録は禁止するが、API 自体は“使える体”で残す ---
+  //     （Instagram 側 JS が navigator.serviceWorker.ready を参照するため、
+  //      プロパティごと消すと Cannot read properties of undefined で落ちる）
+  try {
+    var fakeReg = {
+      scope: "/", installing: null, waiting: null,
+      active: { state: "activated", scriptURL: location.origin + "/sw.js", postMessage: function () {} },
+      update: function () { return Promise.resolve(); },
+      unregister: function () { return Promise.resolve(true); },
+      addEventListener: function () {}, removeEventListener: function () {},
+    };
+    var fakeSW = {
+      controller: null,
+      ready: Promise.resolve(fakeReg),
+      getRegistration: function () { return Promise.resolve(undefined); },
+      getRegistrations: function () { return Promise.resolve([]); },
+      register: function () { return Promise.reject(new Error("service worker disabled by proxy")); },
+      addEventListener: function () {}, removeEventListener: function () {},
+      startMessages: function () {},
+    };
+    Object.defineProperty(navigator, "serviceWorker", { get: function () { return fakeSW; }, configurable: true });
+    if (!("serviceWorker" in window)) { try { window.serviceWorker = fakeSW; } catch (e) {} }
+  } catch (e) {}
+
+  // --- エラーはテレメトリへ（本物の /_diag/instagram 相当）---
   window.addEventListener("error", function (ev) {
     try {
       fetch("%(diag)s", { method: "POST", credentials: "omit", keepalive: true,
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ source: "browser-shim", level: "error",
-          event: "script-error", details: { message: String(ev.message || "") } }) });
-    } catch (_) {}
+          event: "script-error", details: { message: String((ev && ev.message) || "") } }) });
+    } catch (e) {}
   });
 })();
 </script>
@@ -274,7 +382,12 @@ SHIM = """
 
 
 def inject_shim(html: str) -> str:
-    shim = SHIM % {"prefix": CFG.prefix, "diag": CFG.diag}
+    shim = SHIM % {
+        "prefix": CFG.prefix,
+        "ext": CFG.ext_prefix,
+        "media": CFG.media_relay,
+        "diag": CFG.diag,
+    }
     idx = html.lower().find("<head")
     if idx < 0:
         return shim + html

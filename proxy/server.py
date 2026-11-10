@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from .config import CFG
 from .cookies import SessionStore
-from .fetch import UpstreamError, fetch_upstream, open_tunnel
+from .fetch import UpstreamError, fetch_upstream, open_tunnel, rewrite_set_cookie
 from .rewriter import inject_shim, rewrite_body, should_rewrite, to_proxy_url
 from .urlmap import (
     absolute,
@@ -58,6 +58,7 @@ async def _startup() -> None:
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
         headers={"accept-encoding": "gzip, deflate"},  # br は環境依存なので広告しない
         http2=False,
+        proxy=CFG.upstream_proxy or None,             # 出口プロキシ（任意）
     )
 
 
@@ -85,6 +86,19 @@ def _json(body: dict, status: int = 200) -> Response:
     return JSONResponse(body, status_code=status)
 
 
+def _forward_set_cookies(resp: Response, up, request: Request) -> Response:
+    """上流の Set-Cookie をブラウザにも渡す（document.cookie を成立させる）"""
+    if not up.set_cookies:
+        return resp
+    secure_ok = request.url.scheme == "https" or (request.headers.get("x-forwarded-proto") == "https")
+    for sc in up.set_cookies:
+        try:
+            resp.headers.append("set-cookie", rewrite_set_cookie(sc, secure_ok=secure_ok))
+        except Exception:
+            pass
+    return resp
+
+
 def _entity_headers(up, extra: dict[str, str] | None = None) -> dict[str, str]:
     headers = {k: v for k, v in up.headers if k.lower() not in ("location",)}
     if extra:
@@ -96,7 +110,14 @@ def _entity_headers(up, extra: dict[str, str] | None = None) -> dict[str, str]:
 # 0) ビューア
 # ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
-async def viewer() -> HTMLResponse:
+async def viewer(request: Request):
+    """トップレベルはビューア。iframe 内 / ?_ig=1 は Instagram ホームを返す。"""
+    is_frame = (
+        request.query_params.get("_ig") == "1"
+        or (request.headers.get("sec-fetch-dest") or "") == "iframe"
+    )
+    if is_frame:
+        return await _proxy_fetch(CFG.default_target, request)
     return HTMLResponse((APP_DIR / "viewer.html").read_text(encoding="utf-8"))
 
 
@@ -106,13 +127,75 @@ async def health() -> Response:
         "ok": True,
         "uptime_sec": round(time.time() - app.state.started, 1),
         "mode": CFG.mode,
+        "upstream_proxy": bool(CFG.upstream_proxy),
         "stats": app.state.stats,
         "sessions": app.state.sessions.stats(),
     })
 
 
 # ---------------------------------------------------------------------------
-# 1) 透過プロキシ  /p/<encoded-url>
+# 1a) sticky host プロキシ  /<元のパス>  （Instagram の SPA ルーターを壊さない）
+# ---------------------------------------------------------------------------
+RESERVED_EXACT = {"/", "/health", "/session", "/_docs", "/_openapi.json", "/favicon.ico",
+                  "/robots.txt", "/api/media-url"}
+RESERVED_PREFIXES = (CFG.ext_prefix, CFG.prefix, "/instagram/runtime/", "/_diag/", "/_docs",
+                     "/_openapi.json", "/api/", "/_ext")
+
+
+def _is_proxy_owned(path: str, host: str, request: Request | None = None) -> bool:
+    """プロキシ自身のエンドポイントかどうか（それ以外は上流のパスとして扱う）"""
+    # "/" は「トップレベル閲覧ならビューア」「iframe 内 / ?_ig=1 なら Instagram ホーム」
+    if path == "/" and request is not None:
+        if request.query_params.get("_ig") == "1":
+            return False
+        if (request.headers.get("sec-fetch-dest") or "") == "iframe":
+            return False
+    if path in RESERVED_EXACT:
+        return True
+    return path.startswith(RESERVED_PREFIXES)
+
+
+# 注意: この catch-all は「最後に」登録する（他ルートを食わないため）。
+async def sticky_proxy(sticky_path: str, request: Request) -> Response:
+    host = request.headers.get("host", "")
+    path = "/" + sticky_path if not request.url.path.startswith("/") else request.url.path
+    if _is_proxy_owned(path, host, request) or not CFG.sticky_host:
+        return _json({"detail": "Not Found"}, 404)
+    target = CFG.default_target.rstrip("/") + path
+    seen_marker = False
+    query = []
+    for k, v in request.query_params.multi_items():
+        if k == "_ig":
+            if seen_marker:
+                continue
+            seen_marker = True
+            continue
+        query.append((k, v))
+    if query:
+        from urllib.parse import urlencode
+
+        target += "?" + urlencode(query)
+    return await _proxy_fetch(target, request)
+
+
+# ---------------------------------------------------------------------------
+# 1b) 別ホスト用の明示プロキシ  /_ext/<encoded-url>
+# ---------------------------------------------------------------------------
+@app.api_route(
+    CFG.ext_prefix + "{encoded:path}",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def ext_proxy(encoded: str, request: Request) -> Response:
+    from urllib.parse import unquote
+
+    target = unquote(encoded)
+    if not is_http_url(target):
+        return _json({"detail": "invalid target url"}, 400)
+    return await _proxy_fetch(target, request)
+
+
+# ---------------------------------------------------------------------------
+# 1c) 透過プロキシ  /p/<encoded-url> （絶対 URL 明示。互換用）
 # ---------------------------------------------------------------------------
 @app.api_route(
     "/p/{encoded:path}",
@@ -124,7 +207,11 @@ async def proxy(encoded: str, request: Request) -> Response:
     target = unquote(encoded)
     if not is_http_url(target):
         return _json({"detail": "invalid target url"}, 400)
+    return await _proxy_fetch(target, request)
 
+
+async def _proxy_fetch(target: str, request: Request) -> Response:
+    """共通の取得＋書換＋ヘッダ整形"""
     sid, jar = _session(request)
     body = await request.body() if request.method not in ("GET", "HEAD") else b""
     incoming = [(k, v) for k, v in request.headers.items()]
@@ -139,14 +226,14 @@ async def proxy(encoded: str, request: Request) -> Response:
 
     ctype = up.header("content-type")
 
-    # --- リダイレクトは仮想URL空間に付け替える ---
+    # --- リダイレクトは同じプロキシ内の URL に付け替える ---
     location = up.header("location")
     if up.status in (301, 302, 303, 307, 308) and location:
-        new_loc = to_proxy_url(location, target)
+        new_loc = to_proxy_url(location, up.url or target)
         headers = _entity_headers(up, {"location": new_loc})
         resp = Response(b"", status_code=up.status, headers=headers)
         _set_session_cookie(resp, sid)
-        return resp
+        return _forward_set_cookies(resp, up, request)
 
     payload = up.body
     if request.method != "HEAD" and should_rewrite(ctype) and len(payload) <= CFG.max_inspect_bytes:
@@ -162,9 +249,14 @@ async def proxy(encoded: str, request: Request) -> Response:
 
     headers = _entity_headers(up)
     headers["cache-control"] = headers.get("cache-control", "no-store")
+    if "text/html" in (ctype or "").lower():
+        # 自分のビューア（同一オリジン）からだけ埋め込めるようにする。
+        # 上流の X-Frame-Options / CSP は fetch.py で除去済み。
+        headers["x-frame-options"] = "SAMEORIGIN"
+        headers["content-security-policy"] = "frame-ancestors 'self'"
     resp = Response(payload, status_code=up.status, headers=headers)
     _set_session_cookie(resp, sid)
-    return resp
+    return _forward_set_cookies(resp, up, request)
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +479,14 @@ async def _handle_connect(scope, receive, send) -> None:
 
     with _c.suppress(Exception):
         await writer.wait_closed()
+
+
+# ---------------------------------------------------------------------------
+# 8) catch-all（必ず最後に登録）: sticky host プロキシ
+# ---------------------------------------------------------------------------
+app.add_api_route(
+    "/{sticky_path:path}",
+    sticky_proxy,
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
