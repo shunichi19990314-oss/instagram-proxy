@@ -1,5 +1,8 @@
 # instagram-proxy — Instagram 用 Web プロキシ（FastAPI 実装）
 
+> リポジトリ: https://github.com/shunichi19990314-oss/instagram-proxy
+> Railway へのデプロイ: **[DEPLOY_RAILWAY.md](DEPLOY_RAILWAY.md)**（`PROXY_MEDIA_KEY` の設定が必要）
+
 `https://miruhukaka.ai.studio/instagram/` の解析結果をもとに、**同じ外形的仕様**（エンドポイント名・バイナリフレーム・メディア鍵・署名検証・Cookie ジャー・診断ログ）を **サーバーサイド実装**に置き換えて再現したコードです。
 
 本家はブラウザ内で Scramjet（WASM）＋ WISP（WebSocket）を回す構成ですが、こちらは **Python の ASGI サーバーが“書き換え”と“中継”を担当**するため、依存が少なく読み解きやすい形になっています。
